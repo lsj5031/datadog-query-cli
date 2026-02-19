@@ -37,6 +37,19 @@ Binary path after build:
 ./target/debug/datadog-query-cli --help
 ```
 
+Local release install to `~/.local/bin`:
+
+```bash
+cargo build --release --locked
+install -Dm755 target/release/datadog-query-cli ~/.local/bin/datadog-query-cli
+```
+
+Optional short alias:
+
+```bash
+ln -sf ~/.local/bin/datadog-query-cli ~/.local/bin/ddq
+```
+
 ## Quickstart
 
 ```bash
@@ -139,3 +152,10 @@ cargo run -- raw \
 ```bash
 cargo run -- --site us3.datadoghq.com raw --method GET --path /api/v1/validate
 ```
+
+## GitHub Releases
+
+The repo includes `.github/workflows/release.yml`:
+
+- Push a tag like `v0.1.1` to build and publish release assets
+- Or run the workflow manually and provide a `tag`
