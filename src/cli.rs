@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -23,11 +23,49 @@ pub struct Cli {
     pub app_key: Option<String>,
 
     /// Print compact JSON
+    /// Deprecated: prefer --output json
     #[arg(long)]
     pub compact: bool,
 
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+    pub output: OutputFormat,
+
+    /// Number of retry attempts for retryable upstream failures
+    #[arg(long, default_value_t = 3)]
+    pub retries: u32,
+
+    /// Base retry backoff in milliseconds (exponential, capped by --retry-max-backoff-ms)
+    #[arg(long, default_value_t = 250)]
+    pub retry_backoff_ms: u64,
+
+    /// Maximum retry backoff in milliseconds
+    #[arg(long, default_value_t = 5_000)]
+    pub retry_max_backoff_ms: u64,
+
+    /// Whether to retry rate-limited (HTTP 429) responses.
+    /// Pass `--retry-rate-limit=false` to disable.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub retry_rate_limit: bool,
+
+    /// HTTP timeout for Datadog requests in seconds
+    #[arg(long, default_value_t = 30)]
+    pub timeout_seconds: u64,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    pub fn compact_output(&self) -> bool {
+        self.compact || matches!(self.output, OutputFormat::Json)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    Json,
+    Pretty,
 }
 
 #[derive(Subcommand, Debug)]

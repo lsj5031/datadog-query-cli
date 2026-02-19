@@ -8,6 +8,15 @@ pub struct Config {
     pub api_key: String,
     pub app_key: String,
     pub base_url: String,
+    pub retry: RetryConfig,
+    pub timeout_seconds: u64,
+}
+
+pub struct RetryConfig {
+    pub max_retries: u32,
+    pub backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub retry_rate_limit: bool,
 }
 
 impl Config {
@@ -34,10 +43,30 @@ impl Config {
             .unwrap_or_else(|| "datadoghq.com".to_string());
 
         let base_url = normalize_base_url(&site)?;
+
+        if cli.retry_backoff_ms == 0 {
+            return Err(anyhow!("--retry-backoff-ms must be greater than 0."));
+        }
+        if cli.retry_max_backoff_ms < cli.retry_backoff_ms {
+            return Err(anyhow!(
+                "--retry-max-backoff-ms must be greater than or equal to --retry-backoff-ms."
+            ));
+        }
+        if cli.timeout_seconds == 0 {
+            return Err(anyhow!("--timeout-seconds must be greater than 0."));
+        }
+
         Ok(Self {
             api_key,
             app_key,
             base_url,
+            retry: RetryConfig {
+                max_retries: cli.retries,
+                backoff_ms: cli.retry_backoff_ms,
+                max_backoff_ms: cli.retry_max_backoff_ms,
+                retry_rate_limit: cli.retry_rate_limit,
+            },
+            timeout_seconds: cli.timeout_seconds,
         })
     }
 }

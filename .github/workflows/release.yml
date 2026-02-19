@@ -13,15 +13,42 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: "true"
+            binary_name: datadog-query-cli
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: "true"
+            binary_name: datadog-query-cli
+            archive_ext: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            use_cross: "false"
+            binary_name: datadog-query-cli
+            archive_ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            use_cross: "false"
+            binary_name: datadog-query-cli
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: "false"
+            binary_name: datadog-query-cli.exe
+            archive_ext: zip
 
     steps:
       - name: Checkout
@@ -30,33 +57,61 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Determine tag
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cross
+        if: matrix.use_cross == 'true'
+        uses: taiki-e/install-action@cross
+
+      - name: Add Rust target
+        if: matrix.use_cross == 'false'
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
       - name: Build release binary
-        run: cargo build --release --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          name="datadog-query-cli-${RUNNER_OS,,}-x86_64"
+          artifact="datadog-query-cli-${{ steps.meta.outputs.tag }}-${{ matrix.target }}"
           mkdir -p dist
-          cp target/release/datadog-query-cli "dist/${name}"
-          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${artifact}"
+          tar -czf "dist/${artifact}.tar.gz" -C dist "${artifact}"
+          rm -f "dist/${artifact}"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "datadog-query-cli-windows-x86_64"
+          $artifact = "datadog-query-cli-${{ steps.meta.outputs.tag }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item "target/release/datadog-query-cli.exe" "dist/$name.exe"
-          Compress-Archive -Path "dist/$name.exe" -DestinationPath "dist/$name.zip" -Force
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/$artifact.exe"
+          Compress-Archive -Path "dist/$artifact.exe" -DestinationPath "dist/$artifact.zip" -Force
+          Remove-Item "dist/$artifact.exe"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.os }}
-          path: dist/*
+          name: release-${{ matrix.target }}
+          path: dist/*.${{ matrix.archive_ext }}
 
   publish:
     name: Publish GitHub Release
@@ -79,11 +134,46 @@ jobs:
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Collect release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/release/ \;
+
+      - name: Generate checksums
+        shell: bash
+        working-directory: dist/release
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz *.zip > checksums.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign checksums (keyless)
+        shell: bash
+        working-directory: dist/release
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem \
+            checksums.txt
+
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/release/*
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           generate_release_notes: true
           files: |
-            dist/**/*.tar.gz
-            dist/**/*.zip
+            dist/release/*.tar.gz
+            dist/release/*.zip
+            dist/release/checksums.txt
+            dist/release/checksums.txt.sig
+            dist/release/checksums.txt.pem
