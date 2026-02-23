@@ -359,7 +359,13 @@ fn truncate_for_error(text: &str) -> String {
     if text.len() <= MAX_ERROR_BODY_BYTES {
         return text.to_string();
     }
-    format!("{}...(truncated)", &text[..MAX_ERROR_BODY_BYTES])
+
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}...(truncated)", &text[..end])
 }
 
 fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -375,4 +381,26 @@ fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
 
 fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::REQUEST_TIMEOUT || status.is_server_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_for_error;
+
+    #[test]
+    fn truncate_for_error_keeps_short_text() {
+        let text = "short body";
+        assert_eq!(truncate_for_error(text), text);
+    }
+
+    #[test]
+    fn truncate_for_error_handles_multibyte_utf8_without_panicking() {
+        let text = "x".repeat(2_047) + "étail";
+        let truncated = truncate_for_error(&text);
+        let suffix = "...(truncated)";
+        let prefix = truncated.strip_suffix(suffix).unwrap();
+
+        assert!(truncated.ends_with(suffix));
+        assert!(prefix.len() <= 2_048);
+    }
 }
