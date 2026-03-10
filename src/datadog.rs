@@ -180,9 +180,9 @@ impl DatadogClient {
         params: Vec<(String, String)>,
         body: Option<Value>,
     ) -> Result<Value, DatadogError> {
-        let method = Method::from_bytes(method.as_bytes())
+        let method = Method::from_bytes(method.to_ascii_uppercase().as_bytes())
             .context("Invalid HTTP method for raw query.")
-            .map_err(|err| DatadogError::InvalidRequest(err.to_string()))?;
+            .map_err(|err| DatadogError::InvalidRequest(format!("{err:#}")))?;
         let params = if params.is_empty() {
             None
         } else {
@@ -203,7 +203,7 @@ impl DatadogClient {
         loop {
             let mut url = self
                 .resolve_url(path)
-                .map_err(|err| DatadogError::InvalidRequest(err.to_string()))?;
+                .map_err(|err| DatadogError::InvalidRequest(format!("{err:#}")))?;
             if let Some(pairs) = &params {
                 let mut query = url.query_pairs_mut();
                 for (key, value) in pairs {
@@ -361,7 +361,7 @@ fn truncate_for_error(text: &str) -> String {
     }
 
     let mut end = MAX_ERROR_BODY_BYTES;
-    while !text.is_char_boundary(end) {
+    while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
 
@@ -385,7 +385,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_for_error;
+    use super::*;
 
     #[test]
     fn truncate_for_error_keeps_short_text() {
@@ -402,5 +402,25 @@ mod tests {
 
         assert!(truncated.ends_with(suffix));
         assert!(prefix.len() <= 2_048);
+    }
+
+    #[test]
+    fn test_truncate_for_error_boundary() {
+        let mut text = String::new();
+        for _ in 0..1000 {
+            text.push('🦀'); // 4 bytes each
+        }
+        // Total 4000 bytes. Truncating at 2048 bytes.
+        // 2048 is divisible by 4, so it might not panic.
+
+        let mut text2 = String::new();
+        text2.push('a'); // 1 byte
+        for _ in 0..1000 {
+            text2.push('🦀'); // 4 bytes each
+        }
+        // Total 4001 bytes. Truncating at 2048 bytes. 2048 = 1 + 511 * 4 + 3. It will slice in the middle of a crab!
+
+        let truncated = truncate_for_error(&text2);
+        assert!(!truncated.is_empty());
     }
 }

@@ -25,6 +25,8 @@ impl Config {
             .api_key
             .clone()
             .or_else(|| env::var("DD_API_KEY").ok())
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
             .context("Missing Datadog API key. Set --api-key or DD_API_KEY.")?;
 
         let app_key = cli
@@ -32,6 +34,8 @@ impl Config {
             .clone()
             .or_else(|| env::var("DD_APP_KEY").ok())
             .or_else(|| env::var("DD_APPLICATION_KEY").ok())
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
             .context(
                 "Missing Datadog application key. Set --app-key or DD_APP_KEY (or DD_APPLICATION_KEY).",
             )?;
@@ -86,4 +90,34 @@ fn normalize_base_url(site: &str) -> Result<String> {
     }
 
     Ok(format!("https://api.{cleaned}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_base_url() {
+        assert_eq!(
+            normalize_base_url("datadoghq.com").unwrap(),
+            "https://api.datadoghq.com"
+        );
+        assert_eq!(
+            normalize_base_url("us3.datadoghq.com").unwrap(),
+            "https://api.us3.datadoghq.com"
+        );
+        assert_eq!(
+            normalize_base_url("api.datadoghq.eu").unwrap(),
+            "https://api.datadoghq.eu"
+        );
+        assert_eq!(
+            normalize_base_url("https://custom.datadog.com").unwrap(),
+            "https://custom.datadog.com"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:8080/").unwrap(),
+            "http://localhost:8080"
+        );
+        assert!(normalize_base_url("   /   ").is_err());
+    }
 }

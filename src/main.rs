@@ -15,7 +15,7 @@ use crate::app_error::AppError;
 use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::datadog::{DatadogClient, LogsQuery};
-use crate::time_expr::parse_to_unix;
+use crate::time_expr::parse_time;
 
 #[tokio::main]
 async fn main() {
@@ -34,7 +34,7 @@ async fn main() {
 }
 
 async fn run(cli: Cli, compact: bool) -> Result<(), AppError> {
-    let config = Config::from_cli(&cli).map_err(|err| AppError::Usage(err.to_string()))?;
+    let config = Config::from_cli(&cli).map_err(|err| AppError::Usage(format!("{err:#}")))?;
     let client = DatadogClient::new(config);
 
     let response = match cli.command {
@@ -45,32 +45,44 @@ async fn run(cli: Cli, compact: bool) -> Result<(), AppError> {
             limit,
             sort,
             cursor,
-        } => client
-            .query_logs(LogsQuery {
-                query,
-                from,
-                to,
-                limit,
-                sort,
-                cursor,
-            })
-            .await
-            .map_err(AppError::from)?,
+        } => {
+            let now = Utc::now();
+            let from_dt = parse_time(&from, now).map_err(|err| AppError::Usage(format!("{err:#}")))?;
+            let to_dt = parse_time(&to, now).map_err(|err| AppError::Usage(format!("{err:#}")))?;
+
+            if to_dt <= from_dt {
+                return Err(AppError::Usage(
+                    "Invalid logs time window: `to` must be greater than `from`.".to_string(),
+                ));
+            }
+
+            client
+                .query_logs(LogsQuery {
+                    query,
+                    from: from_dt.to_rfc3339(),
+                    to: to_dt.to_rfc3339(),
+                    limit,
+                    sort,
+                    cursor,
+                })
+                .await
+                .map_err(AppError::from)?
+        }
         Command::Metrics { query, from, to } => {
             let now = Utc::now();
-            let from_unix =
-                parse_to_unix(&from, now).map_err(|err| AppError::Usage(err.to_string()))?;
-            let to_unix =
-                parse_to_unix(&to, now).map_err(|err| AppError::Usage(err.to_string()))?;
+            let from_dt =
+                parse_time(&from, now).map_err(|err| AppError::Usage(format!("{err:#}")))?;
+            let to_dt =
+                parse_time(&to, now).map_err(|err| AppError::Usage(format!("{err:#}")))?;
 
-            if to_unix <= from_unix {
+            if to_dt <= from_dt {
                 return Err(AppError::Usage(
                     "Invalid metrics time window: `to` must be greater than `from`.".to_string(),
                 ));
             }
 
             client
-                .query_metrics(&query, from_unix, to_unix)
+                .query_metrics(&query, from_dt.timestamp(), to_dt.timestamp())
                 .await
                 .map_err(AppError::from)?
         }
@@ -80,10 +92,22 @@ async fn run(cli: Cli, compact: bool) -> Result<(), AppError> {
             to,
             limit,
             sort,
-        } => client
-            .query_events(query, from, to, limit, sort)
-            .await
-            .map_err(AppError::from)?,
+        } => {
+            let now = Utc::now();
+            let from_dt = parse_time(&from, now).map_err(|err| AppError::Usage(format!("{err:#}")))?;
+            let to_dt = parse_time(&to, now).map_err(|err| AppError::Usage(format!("{err:#}")))?;
+
+            if to_dt <= from_dt {
+                return Err(AppError::Usage(
+                    "Invalid events time window: `to` must be greater than `from`.".to_string(),
+                ));
+            }
+
+            client
+                .query_events(query, from_dt.to_rfc3339(), to_dt.to_rfc3339(), limit, sort)
+                .await
+                .map_err(AppError::from)?
+        }
         Command::Raw {
             method,
             path,
@@ -134,16 +158,16 @@ fn parse_raw_body(
         (Some(raw), None) => {
             let json = serde_json::from_str::<Value>(&raw)
                 .context("Invalid JSON passed to --body for raw request.")
-                .map_err(|err| AppError::Usage(err.to_string()))?;
+                .map_err(|err| AppError::Usage(format!("{err:#}")))?;
             Ok(Some(json))
         }
         (None, Some(path)) => {
             let contents = fs::read_to_string(&path)
                 .with_context(|| format!("Failed reading raw body file `{}`", path.display()))
-                .map_err(|err| AppError::Usage(err.to_string()))?;
+                .map_err(|err| AppError::Usage(format!("{err:#}")))?;
             let json = serde_json::from_str::<Value>(&contents)
                 .with_context(|| format!("Invalid JSON in raw body file `{}`", path.display()))
-                .map_err(|err| AppError::Usage(err.to_string()))?;
+                .map_err(|err| AppError::Usage(format!("{err:#}")))?;
             Ok(Some(json))
         }
         (None, None) => Ok(None),
@@ -166,4 +190,45 @@ fn print_json_stderr(value: Value, compact: bool) -> Result<(), serde_json::Erro
         eprintln!("{}", serde_json::to_string_pretty(&value)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_parse_query_params() {
+        let params = vec!["key=value".to_string(), "foo=bar=baz".to_string()];
+        let parsed = parse_query_params(&params).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                ("key".to_string(), "value".to_string()),
+                ("foo".to_string(), "bar=baz".to_string())
+            ]
+        );
+
+        let invalid_no_eq = vec!["keyvalue".to_string()];
+        assert!(parse_query_params(&invalid_no_eq).is_err());
+
+        let invalid_empty_key = vec!["=value".to_string()];
+        assert!(parse_query_params(&invalid_empty_key).is_err());
+    }
+
+    #[test]
+    fn test_parse_raw_body() {
+        // test valid string
+        let body = Some(r#"{"key":"value"}"#.to_string());
+        let parsed = parse_raw_body(body, None).unwrap();
+        assert_eq!(parsed, Some(serde_json::json!({"key":"value"})));
+
+        // test both
+        let both_err = parse_raw_body(Some("{}".to_string()), Some(PathBuf::from("file.json")));
+        assert!(both_err.is_err());
+
+        // test invalid string
+        let invalid_body = parse_raw_body(Some("{".to_string()), None);
+        assert!(invalid_body.is_err());
+    }
 }
