@@ -1,6 +1,9 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 
 use crate::cli::Cli;
 
@@ -19,31 +22,43 @@ pub struct RetryConfig {
     pub retry_rate_limit: bool,
 }
 
+#[derive(Deserialize, Default)]
+struct TomlConfig {
+    api_key: Option<String>,
+    app_key: Option<String>,
+    site: Option<String>,
+}
+
 impl Config {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
+        let toml_config = load_toml_config();
+
         let api_key = cli
             .api_key
             .clone()
             .or_else(|| env::var("DD_API_KEY").ok())
+            .or_else(|| toml_config.api_key.clone())
             .map(|k| k.trim().to_string())
             .filter(|k| !k.is_empty())
-            .context("Missing Datadog API key. Set --api-key or DD_API_KEY.")?;
+            .context("Missing Datadog API key. Set --api-key, DD_API_KEY, or api_key in config.toml.")?;
 
         let app_key = cli
             .app_key
             .clone()
             .or_else(|| env::var("DD_APP_KEY").ok())
             .or_else(|| env::var("DD_APPLICATION_KEY").ok())
+            .or_else(|| toml_config.app_key.clone())
             .map(|k| k.trim().to_string())
             .filter(|k| !k.is_empty())
             .context(
-                "Missing Datadog application key. Set --app-key or DD_APP_KEY (or DD_APPLICATION_KEY).",
+                "Missing Datadog application key. Set --app-key, DD_APP_KEY, or app_key in config.toml.",
             )?;
 
         let site = cli
             .site
             .clone()
             .or_else(|| env::var("DD_SITE").ok())
+            .or_else(|| toml_config.site.clone())
             .unwrap_or_else(|| "datadoghq.com".to_string());
 
         let base_url = normalize_base_url(&site)?;
@@ -73,6 +88,40 @@ impl Config {
             timeout_seconds: cli.timeout_seconds,
         })
     }
+}
+
+fn load_toml_config() -> TomlConfig {
+    let config_path = find_config_file();
+    
+    if let Some(path) = config_path {
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if let Ok(config) = toml::from_str::<TomlConfig>(&contents) {
+                return config;
+            }
+        }
+    }
+    
+    TomlConfig::default()
+}
+
+fn find_config_file() -> Option<PathBuf> {
+    // 1. Check local directory first (.ddq.toml or datadog.toml)
+    let local_paths = [PathBuf::from(".ddq.toml"), PathBuf::from("datadog.toml")];
+    for path in &local_paths {
+        if path.exists() {
+            return Some(path.clone());
+        }
+    }
+
+    // 2. Fall back to OS standard config directory (~/.config/ddq/config.toml)
+    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "ddq") {
+        let config_file = proj_dirs.config_dir().join("config.toml");
+        if config_file.exists() {
+            return Some(config_file);
+        }
+    }
+
+    None
 }
 
 fn normalize_base_url(site: &str) -> Result<String> {
