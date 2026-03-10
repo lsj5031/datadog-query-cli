@@ -11,10 +11,7 @@ use crate::config::{Config, RetryConfig};
 pub struct DatadogClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
-    app_key: String,
     retry: RetryConfig,
-    timeout_seconds: u64,
 }
 
 pub struct LogsQuery {
@@ -84,15 +81,38 @@ impl Display for DatadogError {
 impl std::error::Error for DatadogError {}
 
 impl DatadogClient {
-    pub fn new(config: Config) -> Self {
-        Self {
-            http: reqwest::Client::new(),
+    pub fn new(config: Config) -> anyhow::Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "DD-API-KEY",
+            reqwest::header::HeaderValue::from_str(&config.api_key)
+                .context("Invalid characters in Datadog API key")?,
+        );
+        headers.insert(
+            "DD-APPLICATION-KEY",
+            reqwest::header::HeaderValue::from_str(&config.app_key)
+                .context("Invalid characters in Datadog application key")?,
+        );
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(config.timeout_seconds))
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        Ok(Self {
+            http,
             base_url: config.base_url,
-            api_key: config.api_key,
-            app_key: config.app_key,
             retry: config.retry,
-            timeout_seconds: config.timeout_seconds,
-        }
+        })
     }
 
     pub async fn query_logs(&self, query: LogsQuery) -> Result<Value, DatadogError> {
@@ -211,14 +231,7 @@ impl DatadogClient {
                 }
             }
 
-            let mut request = self
-                .http
-                .request(method.clone(), url)
-                .header("DD-API-KEY", &self.api_key)
-                .header("DD-APPLICATION-KEY", &self.app_key)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .timeout(Duration::from_secs(self.timeout_seconds));
+            let mut request = self.http.request(method.clone(), url);
 
             if let Some(payload) = &body {
                 request = request.json(payload);

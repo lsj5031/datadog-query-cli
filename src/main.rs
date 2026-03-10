@@ -35,7 +35,7 @@ async fn main() {
 
 async fn run(cli: Cli, compact: bool) -> Result<(), AppError> {
     let config = Config::from_cli(&cli).map_err(|err| AppError::Usage(format!("{err:#}")))?;
-    let client = DatadogClient::new(config);
+    let client = DatadogClient::new(config).map_err(|err| AppError::Usage(format!("{err:#}")))?;
 
     let response = match cli.command {
         Command::Logs {
