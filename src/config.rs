@@ -13,6 +13,7 @@ pub struct Config {
     pub base_url: String,
     pub retry: RetryConfig,
     pub timeout_seconds: u64,
+    pub retry_timeout_seconds: u64,
 }
 
 pub struct RetryConfig {
@@ -86,6 +87,7 @@ impl Config {
                 retry_rate_limit: cli.retry_rate_limit,
             },
             timeout_seconds: cli.timeout_seconds,
+            retry_timeout_seconds: cli.retry_timeout_seconds,
         })
     }
 }
@@ -93,10 +95,17 @@ impl Config {
 fn load_toml_config() -> TomlConfig {
     let config_path = find_config_file();
     
-    if let Some(path) = config_path {
-        if let Ok(contents) = fs::read_to_string(&path) {
-            if let Ok(config) = toml::from_str::<TomlConfig>(&contents) {
-                return config;
+    if let Some(path) = config_path
+        && let Ok(contents) = fs::read_to_string(&path)
+    {
+        match toml::from_str::<TomlConfig>(&contents) {
+            Ok(config) => return config,
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Failed to parse config file, ignoring"
+                );
             }
         }
     }

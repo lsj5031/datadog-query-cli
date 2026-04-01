@@ -2,6 +2,7 @@ mod app_error;
 mod cli;
 mod config;
 mod datadog;
+mod logging;
 mod time_expr;
 
 use std::fs;
@@ -21,6 +22,12 @@ use crate::time_expr::parse_time;
 async fn main() {
     let cli = Cli::parse();
     let compact = cli.compact_output();
+
+    logging::init(&cli.log_level, cli.log_file.clone());
+
+    if cli.compact {
+        tracing::warn!("--compact is deprecated, use --output json instead");
+    }
 
     if let Err(err) = run(cli, compact).await {
         if print_json_stderr(err.to_json(), compact).is_err() {
@@ -115,6 +122,19 @@ async fn run(cli: Cli, compact: bool) -> Result<(), AppError> {
             body,
             body_file,
         } => {
+            if (path.starts_with("http://") || path.starts_with("https://"))
+                && let Ok(url) = reqwest::Url::parse(&path)
+                && let Some(host) = url.host_str()
+            {
+                let base_host = client.base_host();
+                if !host.eq_ignore_ascii_case(base_host) {
+                    tracing::warn!(
+                        host = host,
+                        base_host = base_host,
+                        "Sending API credentials to external host. Ensure this is intended."
+                    );
+                }
+            }
             let params = parse_query_params(&query_params)?;
             let payload = parse_raw_body(body, body_file)?;
             client

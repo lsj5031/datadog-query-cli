@@ -9,8 +9,7 @@ export DD_API_KEY=...
 export DD_APP_KEY=...
 export DD_SITE=datadoghq.com
 
-datadog-query-cli --output json \
-  logs "service:api @http.status_code:[500 TO 599]" \
+datadog-query-cli logs "service:api @http.status_code:[500 TO 599]" \
   --from now-30m --to now --limit 20
 ```
 
@@ -19,7 +18,7 @@ datadog-query-cli --output json \
 ### Prebuilt binary (Linux/macOS)
 
 ```bash
-VERSION="v0.1.0"
+VERSION="v0.3.0"
 REPO="lsj5031/datadog-query-cli"
 
 case "$(uname -s)-$(uname -m)" in
@@ -49,7 +48,7 @@ install -Dm755 "/tmp/${ASSET}" ~/.local/bin/datadog-query-cli
 ### Prebuilt binary (Windows PowerShell)
 
 ```powershell
-$Version = "v0.1.0"
+$Version = "v0.3.0"
 $Repo = "lsj5031/datadog-query-cli"
 $Asset = "datadog-query-cli-$Version-x86_64-pc-windows-msvc.zip"
 
@@ -69,7 +68,7 @@ install -Dm755 target/release/datadog-query-cli ~/.local/bin/datadog-query-cli
 ### Verify signed checksums (cosign keyless)
 
 ```bash
-VERSION="v0.1.0"
+VERSION="v0.3.0"
 REPO="lsj5031/datadog-query-cli"
 
 curl -fsSL -o checksums.txt \
@@ -86,6 +85,28 @@ cosign verify-blob checksums.txt \
   --certificate-identity-regexp "https://github.com/.+/.+/.github/workflows/release.yml@.+"
 ```
 
+## Configuration
+
+Credentials are resolved in priority order:
+
+1. CLI flags (`--api-key`, `--app-key`)
+2. Environment variables (`DD_API_KEY`, `DD_APP_KEY` / `DD_APPLICATION_KEY`)
+3. TOML config file (`api_key`, `app_key`, `site`)
+
+Config file locations (checked in order):
+
+- `.ddq.toml` (current directory)
+- `datadog.toml` (current directory)
+- `~/.config/ddq/config.toml` (OS standard)
+
+Example `~/.config/ddq/config.toml`:
+
+```toml
+api_key = "..."
+app_key = "..."
+site = "us3.datadoghq.com"
+```
+
 ## Usage
 
 Commands:
@@ -100,38 +121,52 @@ Global flags:
 - `--site`: Datadog site suffix or full API URL (default from `DD_SITE` or `datadoghq.com`)
 - `--api-key`: override `DD_API_KEY`
 - `--app-key`: override `DD_APP_KEY`/`DD_APPLICATION_KEY`
-- `--output`: `json` (default) or `pretty`
-- `--retries`, `--retry-backoff-ms`, `--retry-max-backoff-ms`, `--retry-rate-limit`, `--timeout-seconds`
-- `--compact`: deprecated alias for compact JSON output
+- `--output`: `json` (default, compact) or `pretty`
+- `--log-level`: `error`, `warn`, `info` (default), `debug`, `trace`
+- `--log-file <PATH>`: write JSONL structured logs to file (in addition to stderr)
+- `--retries`, `--retry-backoff-ms`, `--retry-max-backoff-ms`, `--retry-rate-limit`, `--retry-timeout-seconds`, `--timeout-seconds`
+- `--compact`: deprecated, use `--output json` instead
 
 Examples:
 
 ```bash
 # Logs
-datadog-query-cli --output json \
-  logs "env:prod service:web" \
+datadog-query-cli logs "env:prod service:web" \
   --from now-1h --to now --limit 50 --sort desc
 
 # Metrics
-datadog-query-cli --output json \
-  metrics "avg:system.cpu.user{host:my-host}" \
+datadog-query-cli metrics "avg:system.cpu.user{host:my-host}" \
   --from now-15m --to now
 
 # Events
-datadog-query-cli --output json \
-  events --query "service:web status:error" \
+datadog-query-cli events --query "service:web status:error" \
   --from now-1h --to now --limit 25
 
 # Raw GET
-datadog-query-cli --output json raw \
+datadog-query-cli raw \
   --method GET \
   --path /api/v1/validate
 
 # Raw POST with body
-datadog-query-cli --output json raw \
+datadog-query-cli raw \
   --method POST \
   --path /api/v2/logs/events/search \
   --body '{"filter":{"query":"service:api","from":"now-15m","to":"now"},"page":{"limit":10}}'
+```
+
+### Structured Logging
+
+All logs are JSONL (JSON Lines) to stderr, pipe-friendly for `jq`:
+
+```bash
+# Capture stdout, send logs to file
+datadog-query-cli --log-level debug --log-file debug.jsonl \
+  logs "service:api" --from now-5m 2>/dev/null
+
+# Debug with jq
+datadog-query-cli --log-level info logs "service:api" 2>logs.jsonl
+cat logs.jsonl | jq 'select(.fields.reason == "rate_limit")'
+cat logs.jsonl | jq 'select(.level == "WARN" or .level == "ERROR")'
 ```
 
 ## Error Handling
@@ -154,8 +189,13 @@ Error envelope format:
     "category": "rate_limit",
     "exit_code": 4,
     "status": 429,
-    "retryable": false,
+    "retryable": true,
+    "retried": 3,
     "retry_after_ms": 1000,
+    "rate_limit_remaining": 0,
+    "rate_limit_limit": 300,
+    "rate_limit_reset": 14,
+    "rate_limit_period": 30,
     "message": "..."
   }
 }
@@ -176,7 +216,18 @@ Retry controls:
 - `--retry-backoff-ms <MS>` (default `250`)
 - `--retry-max-backoff-ms <MS>` (default `5000`)
 - `--retry-rate-limit=<true|false>` (default `true`)
+- `--retry-timeout-seconds <N>` (default `60`, set `0` for no cap)
 - `--timeout-seconds <N>` (default `30`)
+
+### 429 Rate-Limit Retry Behavior
+
+On HTTP 429, the tool resolves the retry sleep duration in this priority:
+
+1. `Retry-After` response header (seconds or HTTP-date)
+2. `X-RateLimit-Reset` header (seconds until limit resets)
+3. Exponential backoff (from `--retry-backoff-ms`, capped at `--retry-max-backoff-ms`)
+
+Retries are also capped by `--retry-timeout-seconds` to prevent indefinite waiting.
 
 ## Release Artifacts
 
@@ -197,3 +248,40 @@ Published files:
 - `checksums.txt.sig`
 - `checksums.txt.pem`
 - GitHub artifact attestation
+
+## Changelog
+
+### v0.3.0
+
+**Structured logging and 429 rate-limit overhaul.**
+
+- Added JSONL structured logging to stderr via `tracing` + `tracing-subscriber`
+  - `--log-level` flag (error/warn/info/debug/trace, default info)
+  - `--log-file <PATH>` flag for dual-output logging (stderr + file)
+  - All log output is valid JSONL, compatible with `jq` for pipeline debugging
+- Rewrote 429 rate-limit retry logic:
+  - Retry sleep now uses `Retry-After` header first, then `X-RateLimit-Reset` header, then exponential backoff
+  - Added `--retry-timeout-seconds` flag to cap total retry time (default 60s)
+  - Added `retried` count and `rate_limit_info` (remaining/limit/reset/period) to error JSON
+  - Changed `retryable` from `false` to `true` in rate-limited error output
+  - Structured tracing on every retry attempt (attempt number, sleep_ms, reason, status)
+- Added credential-leak warning when `raw` command sends API keys to an external host
+- Added `--compact` deprecation warning (use `--output json` instead)
+- TOML config parse errors now logged as warnings instead of silently ignored
+- Error response bodies are trimmed of leading/trailing whitespace
+- Rate-limit header values logged as native JSON types (not Debug-formatted strings)
+- Fixed clippy warnings (collapsible if-lets)
+- Test coverage: 29 tests (up from 7)
+
+### v0.2.0
+
+- Added TOML configuration file support (`.ddq.toml`, `datadog.toml`, `~/.config/ddq/config.toml`)
+- Added `--output` flag (`json` default, `pretty` for indented)
+- Added retry controls: `--retries`, `--retry-backoff-ms`, `--retry-max-backoff-ms`, `--retry-rate-limit`
+
+### v0.1.0
+
+- Initial release
+- `logs`, `metrics`, `events`, `raw` commands
+- Exponential backoff retries for 5xx and transport errors
+- JSON error envelope with deterministic exit codes

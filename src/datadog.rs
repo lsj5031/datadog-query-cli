@@ -12,6 +12,7 @@ pub struct DatadogClient {
     http: reqwest::Client,
     base_url: String,
     retry: RetryConfig,
+    retry_timeout: Duration,
 }
 
 pub struct LogsQuery {
@@ -33,6 +34,8 @@ pub enum DatadogError {
     RateLimited {
         body: String,
         retry_after_ms: Option<u64>,
+        retried: u32,
+        rate_limit_info: Option<RateLimitInfo>,
     },
     Retryable {
         status: Option<u16>,
@@ -42,6 +45,14 @@ pub enum DatadogError {
         status: u16,
         body: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct RateLimitInfo {
+    pub remaining: Option<u64>,
+    pub limit: Option<u64>,
+    pub reset: Option<u64>,
+    pub period: Option<u64>,
 }
 
 impl Display for DatadogError {
@@ -54,14 +65,16 @@ impl Display for DatadogError {
             Self::RateLimited {
                 body,
                 retry_after_ms,
+                retried,
+                ..
             } => {
                 if let Some(delay) = retry_after_ms {
                     write!(
                         f,
-                        "Datadog rate limited request (429, retry_after_ms={delay}): {body}"
+                        "Datadog rate limited request (429, retried={retried}, retry_after_ms={delay}): {body}"
                     )
                 } else {
-                    write!(f, "Datadog rate limited request (429): {body}")
+                    write!(f, "Datadog rate limited request (429, retried={retried}): {body}")
                 }
             }
             Self::Retryable { status, message } => {
@@ -110,9 +123,17 @@ impl DatadogClient {
 
         Ok(Self {
             http,
-            base_url: config.base_url,
+            base_url: config.base_url.clone(),
             retry: config.retry,
+            retry_timeout: Duration::from_secs(config.retry_timeout_seconds),
         })
+    }
+
+    pub fn base_host(&self) -> &str {
+        self.base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
     }
 
     pub async fn query_logs(&self, query: LogsQuery) -> Result<Value, DatadogError> {
@@ -219,8 +240,29 @@ impl DatadogClient {
         body: Option<Value>,
     ) -> Result<Value, DatadogError> {
         let mut attempt: u32 = 0;
+        let start = std::time::Instant::now();
 
         loop {
+            if self.retry_timeout > Duration::ZERO
+                && attempt > 0
+                && start.elapsed() >= self.retry_timeout
+            {
+                tracing::warn!(
+                    attempt = attempt,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    timeout_ms = self.retry_timeout.as_millis() as u64,
+                    "Retry timeout exceeded, stopping retries"
+                );
+                break Err(DatadogError::Retryable {
+                    status: None,
+                    message: format!(
+                        "Retry timeout of {}s exceeded after {} attempt(s)",
+                        self.retry_timeout.as_secs(),
+                        attempt
+                    ),
+                });
+            }
+
             let mut url = self
                 .resolve_url(path)
                 .map_err(|err| DatadogError::InvalidRequest(format!("{err:#}")))?;
@@ -241,12 +283,27 @@ impl DatadogClient {
                 Ok(response) => response,
                 Err(err) => {
                     if is_retryable_transport_error(&err) && attempt < self.retry.max_retries {
+                        let backoff = self.backoff_ms(attempt);
+                        tracing::info!(
+                            attempt = attempt + 1,
+                            max_retries = self.retry.max_retries,
+                            sleep_ms = backoff,
+                            reason = "transport_error",
+                            error = %err,
+                            "Retrying request"
+                        );
                         self.sleep_before_retry(attempt, None).await;
                         attempt += 1;
                         continue;
                     }
 
                     if is_retryable_transport_error(&err) {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_retries = self.retry.max_retries,
+                            error = %err,
+                            "Request failed, no retries remaining"
+                        );
                         return Err(DatadogError::Retryable {
                             status: None,
                             message: format!(
@@ -264,11 +321,21 @@ impl DatadogClient {
             };
 
             let status = response.status();
-            let retry_after_ms = parse_retry_after_ms(response.headers());
+            let headers = response.headers().clone();
+            let retry_after_ms = parse_retry_after_ms(&headers);
+            let rate_limit_info = parse_rate_limit_headers(&headers);
             let text = match response.text().await {
                 Ok(text) => text,
                 Err(err) => {
                     if attempt < self.retry.max_retries {
+                        let backoff = self.backoff_ms(attempt);
+                        tracing::info!(
+                            attempt = attempt + 1,
+                            max_retries = self.retry.max_retries,
+                            sleep_ms = backoff,
+                            reason = "body_read_error",
+                            "Retrying request"
+                        );
                         self.sleep_before_retry(attempt, None).await;
                         attempt += 1;
                         continue;
@@ -295,28 +362,69 @@ impl DatadogClient {
                 };
             }
 
-            let body = truncate_for_error(&text);
+            let err_body = truncate_for_error(&text);
             if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
                 return Err(DatadogError::Auth {
                     status: status.as_u16(),
-                    body,
+                    body: err_body,
                 });
             }
 
             if status == StatusCode::TOO_MANY_REQUESTS {
+                if let Some(ref info) = rate_limit_info {
+                    tracing::info!(
+                        remaining = info.remaining,
+                        limit = info.limit,
+                        reset = info.reset,
+                        period = info.period,
+                        "Rate limit headers from Datadog"
+                    );
+                }
+
                 if self.retry.retry_rate_limit && attempt < self.retry.max_retries {
-                    self.sleep_before_retry(attempt, retry_after_ms).await;
+                    let sleep_ms = compute_429_sleep_ms(
+                        retry_after_ms,
+                        rate_limit_info.as_ref(),
+                        self.backoff_ms(attempt),
+                    );
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        max_retries = self.retry.max_retries,
+                        sleep_ms,
+                        reason = "rate_limit",
+                        status = 429,
+                        "Retrying request"
+                    );
+                    sleep(Duration::from_millis(sleep_ms)).await;
                     attempt += 1;
                     continue;
                 }
+
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_retries = self.retry.max_retries,
+                    retry_rate_limit = self.retry.retry_rate_limit,
+                    "Rate limited, no retries remaining"
+                );
                 return Err(DatadogError::RateLimited {
-                    body,
+                    body: err_body,
                     retry_after_ms,
+                    retried: attempt,
+                    rate_limit_info,
                 });
             }
 
             if is_retryable_status(status) {
                 if attempt < self.retry.max_retries {
+                    let backoff = self.backoff_ms(attempt);
+                    tracing::info!(
+                        attempt = attempt + 1,
+                        max_retries = self.retry.max_retries,
+                        sleep_ms = backoff,
+                        reason = "server_error",
+                        status = status.as_u16(),
+                        "Retrying request"
+                    );
                     self.sleep_before_retry(attempt, None).await;
                     attempt += 1;
                     continue;
@@ -327,14 +435,14 @@ impl DatadogClient {
                         "Datadog API returned {} after {} attempt(s): {}",
                         status.as_u16(),
                         attempt + 1,
-                        body
+                        err_body
                     ),
                 });
             }
 
             return Err(DatadogError::Api {
                 status: status.as_u16(),
-                body,
+                body: err_body,
             });
         }
     }
@@ -367,25 +475,85 @@ impl DatadogClient {
     }
 }
 
+fn compute_429_sleep_ms(
+    retry_after_ms: Option<u64>,
+    rate_limit_info: Option<&RateLimitInfo>,
+    backoff_ms: u64,
+) -> u64 {
+    if let Some(ms) = retry_after_ms {
+        return ms;
+    }
+    if let Some(info) = rate_limit_info
+        && let Some(reset_secs) = info.reset
+    {
+        return reset_secs.saturating_mul(1_000);
+    }
+    backoff_ms
+}
+
 fn truncate_for_error(text: &str) -> String {
+    let trimmed = text.trim();
     const MAX_ERROR_BODY_BYTES: usize = 2_048;
-    if text.len() <= MAX_ERROR_BODY_BYTES {
-        return text.to_string();
+    if trimmed.len() <= MAX_ERROR_BODY_BYTES {
+        return trimmed.to_string();
     }
 
     let mut end = MAX_ERROR_BODY_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
+    while end > 0 && !trimmed.is_char_boundary(end) {
         end -= 1;
     }
 
-    format!("{}...(truncated)", &text[..end])
+    format!("{}...(truncated)", &trimmed[..end])
 }
 
 fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let value = headers.get("Retry-After")?;
     let as_text = value.to_str().ok()?.trim();
-    let seconds = as_text.parse::<u64>().ok()?;
-    Some(seconds.saturating_mul(1_000))
+
+    // Try integer seconds first
+    if let Ok(seconds) = as_text.parse::<u64>() {
+        return Some(seconds.saturating_mul(1_000));
+    }
+
+    // Try HTTP-date format (RFC 2822 / IMF-fixdate)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(as_text) {
+        let now = chrono::Utc::now();
+        let remaining = dt.with_timezone(&chrono::Utc) - now;
+        let ms = remaining.num_milliseconds().max(0) as u64;
+        return Some(ms);
+    }
+
+    None
+}
+
+fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Option<RateLimitInfo> {
+    let remaining = headers
+        .get("X-RateLimit-Remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let limit = headers
+        .get("X-RateLimit-Limit")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let reset = headers
+        .get("X-RateLimit-Reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let period = headers
+        .get("X-RateLimit-Period")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+
+    if remaining.is_some() || limit.is_some() || reset.is_some() || period.is_some() {
+        Some(RateLimitInfo {
+            remaining,
+            limit,
+            reset,
+            period,
+        })
+    } else {
+        None
+    }
 }
 
 fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
@@ -399,6 +567,23 @@ fn is_retryable_status(status: StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_client() -> DatadogClient {
+        let config = Config {
+            api_key: "test-key".to_string(),
+            app_key: "test-app-key".to_string(),
+            base_url: "https://api.datadoghq.com".to_string(),
+            retry: RetryConfig {
+                max_retries: 3,
+                backoff_ms: 10,
+                max_backoff_ms: 100,
+                retry_rate_limit: true,
+            },
+            timeout_seconds: 5,
+            retry_timeout_seconds: 5,
+        };
+        DatadogClient::new(config).unwrap()
+    }
 
     #[test]
     fn truncate_for_error_keeps_short_text() {
@@ -421,19 +606,217 @@ mod tests {
     fn test_truncate_for_error_boundary() {
         let mut text = String::new();
         for _ in 0..1000 {
-            text.push('🦀'); // 4 bytes each
+            text.push('🦀');
         }
-        // Total 4000 bytes. Truncating at 2048 bytes.
-        // 2048 is divisible by 4, so it might not panic.
 
         let mut text2 = String::new();
-        text2.push('a'); // 1 byte
+        text2.push('a');
         for _ in 0..1000 {
-            text2.push('🦀'); // 4 bytes each
+            text2.push('🦀');
         }
-        // Total 4001 bytes. Truncating at 2048 bytes. 2048 = 1 + 511 * 4 + 3. It will slice in the middle of a crab!
 
         let truncated = truncate_for_error(&text2);
         assert!(!truncated.is_empty());
     }
+
+    #[test]
+    fn test_backoff_exponential_capped() {
+        let client = test_client();
+        // backoff_ms: 10, max: 100
+        // attempt 0: 10 * 1 = 10
+        assert_eq!(client.backoff_ms(0), 10);
+        // attempt 1: 10 * 2 = 20
+        assert_eq!(client.backoff_ms(1), 20);
+        // attempt 2: 10 * 4 = 40
+        assert_eq!(client.backoff_ms(2), 40);
+        // attempt 3: 10 * 8 = 80
+        assert_eq!(client.backoff_ms(3), 80);
+        // attempt 4: 10 * 16 = 160 -> capped at 100
+        assert_eq!(client.backoff_ms(4), 100);
+        // attempt 10: still capped
+        assert_eq!(client.backoff_ms(10), 100);
+    }
+
+    #[test]
+    fn test_retry_after_seconds_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Retry-After", "30".parse().unwrap());
+        let result = parse_retry_after_ms(&headers);
+        assert_eq!(result, Some(30_000));
+    }
+
+    #[test]
+    fn test_retry_after_missing_header() {
+        let headers = reqwest::header::HeaderMap::new();
+        let result = parse_retry_after_ms(&headers);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_retry_after_http_date() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        // Set a date 45 seconds in the future
+        let future = chrono::Utc::now() + chrono::Duration::seconds(45);
+        let date_str = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        headers.insert("Retry-After", date_str.parse().unwrap());
+        let result = parse_retry_after_ms(&headers);
+        assert!(result.is_some());
+        let ms = result.unwrap();
+        // Should be roughly 45 seconds, allow 2s tolerance for test execution
+        assert!(ms > 43_000, "Expected >43000ms, got {ms}");
+        assert!(ms <= 45_000, "Expected <=45000ms, got {ms}");
+    }
+
+    #[test]
+    fn test_retry_after_http_date_past() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        // Date in the past -> should give 0 or near-zero
+        let past = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let date_str = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        headers.insert("Retry-After", date_str.parse().unwrap());
+        let result = parse_retry_after_ms(&headers);
+        assert_eq!(result, Some(0));
+    }
+
+    #[test]
+    fn test_retry_after_garbage_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Retry-After", "not-a-valid-value".parse().unwrap());
+        let result = parse_retry_after_ms(&headers);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-RateLimit-Limit", "300".parse().unwrap());
+        headers.insert("X-RateLimit-Remaining", "5".parse().unwrap());
+        headers.insert("X-RateLimit-Reset", "1700000000".parse().unwrap());
+        headers.insert("X-RateLimit-Period", "60".parse().unwrap());
+
+        let info = parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.limit, Some(300));
+        assert_eq!(info.remaining, Some(5));
+        assert_eq!(info.reset, Some(1700000000));
+        assert_eq!(info.period, Some(60));
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_partial() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-RateLimit-Remaining", "10".parse().unwrap());
+
+        let info = parse_rate_limit_headers(&headers).unwrap();
+        assert_eq!(info.remaining, Some(10));
+        assert_eq!(info.limit, None);
+        assert_eq!(info.reset, None);
+        assert_eq!(info.period, None);
+    }
+
+    #[test]
+    fn test_parse_rate_limit_headers_empty() {
+        let headers = reqwest::header::HeaderMap::new();
+        let result = parse_rate_limit_headers(&headers);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_base_host() {
+        let client = test_client();
+        assert_eq!(client.base_host(), "api.datadoghq.com");
+    }
+
+    #[test]
+    fn test_base_host_custom_url() {
+        let config = Config {
+            api_key: "test-key".to_string(),
+            app_key: "test-app-key".to_string(),
+            base_url: "http://localhost:8080".to_string(),
+            retry: RetryConfig {
+                max_retries: 3,
+                backoff_ms: 10,
+                max_backoff_ms: 100,
+                retry_rate_limit: true,
+            },
+            timeout_seconds: 5,
+            retry_timeout_seconds: 5,
+        };
+        let client = DatadogClient::new(config).unwrap();
+        assert_eq!(client.base_host(), "localhost:8080");
+    }
+
+    // --- Bug 1 tests: compute_429_sleep_ms uses X-RateLimit-Reset fallback ---
+
+    #[test]
+    fn test_compute_429_sleep_prefers_retry_after_over_reset() {
+        // When both Retry-After and X-RateLimit-Reset are present, Retry-After wins
+        let retry_after_ms = Some(5000u64);
+        let rate_limit_info = Some(RateLimitInfo {
+            remaining: Some(0),
+            limit: Some(2),
+            reset: Some(14),
+            period: Some(30),
+        });
+        let backoff = 250u64;
+        let result = compute_429_sleep_ms(retry_after_ms, rate_limit_info.as_ref(), backoff);
+        assert_eq!(result, 5000);
+    }
+
+    #[test]
+    fn test_compute_429_sleep_uses_reset_when_no_retry_after() {
+        // When Retry-After is missing, use X-RateLimit-Reset (seconds -> ms)
+        let retry_after_ms = None;
+        let rate_limit_info = Some(RateLimitInfo {
+            remaining: Some(0),
+            limit: Some(2),
+            reset: Some(14),
+            period: Some(30),
+        });
+        let backoff = 250u64;
+        let result = compute_429_sleep_ms(retry_after_ms, rate_limit_info.as_ref(), backoff);
+        assert_eq!(result, 14_000);
+    }
+
+    #[test]
+    fn test_compute_429_sleep_uses_backoff_when_neither() {
+        // When both Retry-After and X-RateLimit-Reset are missing, fall back to backoff
+        let retry_after_ms = None;
+        let rate_limit_info = Some(RateLimitInfo {
+            remaining: Some(0),
+            limit: Some(2),
+            reset: None,
+            period: Some(30),
+        });
+        let backoff = 500u64;
+        let result = compute_429_sleep_ms(retry_after_ms, rate_limit_info.as_ref(), backoff);
+        assert_eq!(result, 500);
+    }
+
+    #[test]
+    fn test_compute_429_sleep_uses_backoff_when_no_rate_limit_info() {
+        let retry_after_ms = None;
+        let rate_limit_info: Option<RateLimitInfo> = None;
+        let backoff = 750u64;
+        let result = compute_429_sleep_ms(retry_after_ms, rate_limit_info.as_ref(), backoff);
+        assert_eq!(result, 750);
+    }
+
+    // --- Bug 3 tests: truncate_for_error trims whitespace ---
+
+    #[test]
+    fn test_truncate_for_error_trims_whitespace() {
+        let text = "\n  {\"error\": \"too many requests\"}\n  ";
+        assert_eq!(truncate_for_error(text), "{\"error\": \"too many requests\"}");
+    }
+
+    #[test]
+    fn test_truncate_for_error_trims_and_truncates() {
+        let inner = "x".repeat(2_060);
+        let text = format!("\n{inner}\n");
+        let result = truncate_for_error(&text);
+        assert!(!result.starts_with('\n'));
+        assert!(result.ends_with("...(truncated)"));
+        assert!(result.len() <= 2_048 + "...(truncated)".len());
+    }
 }
+

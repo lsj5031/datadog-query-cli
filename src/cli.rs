@@ -48,9 +48,21 @@ pub struct Cli {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub retry_rate_limit: bool,
 
+    /// Maximum total time spent retrying in seconds (0 = no cap)
+    #[arg(long, default_value_t = 60)]
+    pub retry_timeout_seconds: u64,
+
     /// HTTP timeout for Datadog requests in seconds
     #[arg(long, default_value_t = 30)]
     pub timeout_seconds: u64,
+
+    /// Log level: error, warn, info, debug, trace
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Write JSONL logs to a file in addition to stderr
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
